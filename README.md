@@ -82,4 +82,4 @@
 ### 方式一：一键下载并运行（推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Peters-Pans/deploy-openclaw.sh/main/deploy-openclaw.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Peters-Pans/deploy-openclaw/main/deploy-openclaw.sh | bash
