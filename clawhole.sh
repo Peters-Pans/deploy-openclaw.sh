@@ -1,5 +1,5 @@
 #!/bin/bash
-# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.2
+# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.3
 # 支持 macOS + Linux (Ubuntu/Debian/CentOS/RHEL/Fedora)
 #
 # 用法: ./clawhole.sh [选项]
@@ -8,7 +8,7 @@ set -e
 set -o pipefail
 
 # ========== 全局配置 ==========
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.3.0"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 readonly TUNNEL_NAME="openclaw-tunnel"
@@ -28,27 +28,16 @@ OC_CONFIG_DIR=""
 CF_CONFIG_DIR=""
 LOG_FILE=""
 
-# ========== 版本比较（兼容 macOS sort）==========
-# macOS sort 不支持 -V，用 awk 手动比较
+# ========== 版本比较（纯 bash，不依赖 sort -V）==========
 version_gte() {
-    # 返回 0 如果 $1 >= $2
-    awk -v a="$1" -v b="$2" 'BEGIN {
-        split(a, aa, "."); split(b, bb, ".")
-        for (i = 1; i <= 3; i++) {
-            if (aa[i]+0 > bb[i]+0) exit 0
-            if (aa[i]+0 < bb[i]+0) exit 1
-        }
-        exit 0
-    }' 2>/dev/null || {
-        # 极端 fallback: 纯 bash
-        local IFS='.'
-        local -a aa=($1) bb=($2)
-        for i in 0 1 2; do
-            [ "${aa[$i]:-0}" -gt "${bb[$i]:-0}" ] && return 0
-            [ "${aa[$i]:-0}" -lt "${bb[$i]:-0}" ] && return 1
-        done
-        return 0
-    }
+    local IFS='.'
+    local -a aa=($1) bb=($2)
+    for i in 0 1 2; do
+        local a="${aa[$i]:-0}" b="${bb[$i]:-0}"
+        [ "$a" -gt "$b" ] && return 0
+        [ "$a" -lt "$b" ] && return 1
+    done
+    return 0
 }
 
 # ========== 端口检测（多工具回退）==========
@@ -65,7 +54,6 @@ port_in_use() {
 log() {
     local msg="$1" level="${2:-INFO}" color="$BLUE"
     case "$level" in INFO) color="$BLUE" ;; WARN) color="$YELLOW" ;; ERROR) color="$RED" ;; SUCCESS) color="$GREEN" ;; esac
-    # LOG_FILE 可能尚未初始化，安全追加
     if [ -n "$LOG_FILE" ]; then
         echo -e "${color}[${level}]${NC} $msg" | tee -a "$LOG_FILE"
     else
@@ -77,34 +65,55 @@ warn() { log "$1" "WARN" >&2; }
 error() { log "$1" "ERROR" >&2; exit 1; }
 success() { log "$1" "SUCCESS"; }
 
-# Token 生成：失败则报错退出，不静默降级
 generate_secure_token() {
     openssl rand -hex 32 2>/dev/null || error "openssl 不可用，无法生成安全 Token。请安装 openssl。"
 }
 
-# 安全写入 openclaw 配置：通过文件传递 Token，避免暴露在 ps 中
+# 安全写入 openclaw 配置项
+# Token 通过临时文件传递，不暴露在 ps 中
+# 其他值正常写入
 oc_config_set() {
     local key="$1" value="$2"
     if [ "$key" = "gateway.auth.token" ]; then
-        # Token 通过 stdin 传入，不经过命令行参数
-        echo -n "$value" | openclaw config set "$key" --stdin >> "$LOG_FILE" 2>&1 || \
-            # 回退: 写入临时文件再读取（权限 600）
-            { local tmpf=$(mktemp) && echo -n "$value" > "$tmpf" && chmod 600 "$tmpf" && \
-              openclaw config set "$key" "$(cat "$tmpf")" >> "$LOG_FILE" 2>&1 && rm -f "$tmpf"; }
+        # 写入临时文件（权限 600），通过 cat 传入
+        local tmpf
+        tmpf=$(mktemp) || error "无法创建临时文件"
+        chmod 600 "$tmpf"
+        echo -n "$value" > "$tmpf"
+        openclaw config set "$key" --file "$tmpf" >> "$LOG_FILE" 2>&1 || \
+            # --file 不支持时的 fallback：通过 stdin
+            openclaw config set "$key" "$(cat "$tmpf")" >> "$LOG_FILE" 2>&1
+        rm -f "$tmpf"
     else
         openclaw config set "$key" "$value" >> "$LOG_FILE" 2>&1
     fi
 }
 
-# JSON 解析：优先 jq，回退到 grep（仅限简单字段）
+# JSON 解析：优先 jq，回退 grep
 json_field() {
     local json="$1" field="$2"
     if command -v jq &>/dev/null; then
         echo "$json" | jq -r "$field" 2>/dev/null
     else
-        # 简单回退: 提取第一层字符串字段
-        local key=$(echo "$field" | sed 's/.*\.//' | sed 's/\.result\.//')
+        local key
+        key=$(echo "$field" | sed 's/.*\.//')
         echo "$json" | sed -n "s/.*\"${key}\":\"\([^\"]*\)\".*/\1/p" | head -1
+    fi
+}
+
+# 屏蔽 set -x 对敏感命令的输出（防止 Token 进日志）
+# 用法: _quiet curl ... ; _quiet_end
+_quiet_save=""
+_quiet() {
+    if [[ "$-" == *x* ]]; then
+        _quiet_save="x"
+        set +x
+    fi
+}
+_quiet_end() {
+    if [ "$_quiet_save" = "x" ]; then
+        set -x
+        _quiet_save=""
     fi
 }
 
@@ -297,6 +306,9 @@ service_stop() {
 _install_launchd() {
     local oc_bin="$1"
     local dir="$HOME/Library/LaunchAgents"
+    # 动态获取 cloudflared 路径（兼容 Intel / Apple Silicon）
+    local cf_bin
+    cf_bin=$(command -v cloudflared 2>/dev/null || echo "/opt/homebrew/bin/cloudflared")
     mkdir -p "$dir"
     cat > "$dir/ai.openclaw.gateway.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -317,7 +329,7 @@ EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>Label</key><string>com.cloudflare.cloudflared</string>
-    <key>ProgramArguments</key><array><string>/opt/homebrew/bin/cloudflared</string><string>tunnel</string><string>--config</string><string>$CF_CONFIG_DIR/config.yml</string><string>run</string><string>$TUNNEL_NAME</string></array>
+    <key>ProgramArguments</key><array><string>$cf_bin</string><string>tunnel</string><string>--config</string><string>$CF_CONFIG_DIR/config.yml</string><string>run</string><string>$TUNNEL_NAME</string></array>
     <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>NetworkState</key><true/><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
@@ -581,11 +593,8 @@ configure_tunnel() {
     if cloudflared tunnel list 2>/dev/null | grep -q "$TUNNEL_NAME"; then
         tunnel_id=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}')
         warn "⚠️  复用隧道: $tunnel_id"
-        # 检查凭据文件是否存在
         if [ ! -f "$CF_CONFIG_DIR/$tunnel_id.json" ]; then
-            warn "⚠️  凭据文件 $CF_CONFIG_DIR/$tunnel_id.json 不存在，可能需要重新创建隧道"
-            warn "    运行: cloudflared tunnel delete $TUNNEL_NAME && rm -f $CF_CONFIG_DIR/$tunnel_id.json"
-            warn "    然后重新执行本脚本"
+            error "凭据文件 $CF_CONFIG_DIR/$tunnel_id.json 不存在。请先删除旧隧道: cloudflared tunnel delete $TUNNEL_NAME"
         fi
     else
         local out=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
@@ -623,31 +632,39 @@ configure_cf_access() {
     [ -z "$CF_API_TOKEN" ] && { read -s -p "▶ CF API Token: " CF_API_TOKEN; echo ""; }
     [ -z "$CF_ACCOUNT_ID" ] && read -p "▶ CF Account ID: " CF_ACCOUNT_ID
     [ -z "$ACCESS_EMAIL" ] && read -p "▶ 允许的邮箱: " ACCESS_EMAIL
+    [ -z "$CF_TEAM_NAME" ] && read -p "▶ Zero Trust Team Name (如 myteam): " CF_TEAM_NAME
     local api="https://api.cloudflare.com/client/v4"
-    # CF API Token 不写入日志
+
+    # 屏蔽 set -x 防止 Token 进日志
+    _quiet
     info "创建 Access Application..."
     local resp=$(curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
         -d '{"name":"OpenClaw","domain":"'"$DOMAIN"'","type":"self_hosted","session_duration":"24h","auto_redirect_to_identity":false}' \
         2>> "$LOG_FILE")
+    _quiet_end
+
     local app_id=$(json_field "$resp" '.result.id')
     local app_aud=$(json_field "$resp" '.result.aud')
     if [ -z "$app_id" ] || [ "$app_id" = "null" ]; then
-        # 可能已存在，查找
+        _quiet
         local existing=$(curl -s "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
             -H "Authorization: Bearer $CF_API_TOKEN" 2>> "$LOG_FILE")
-        app_id=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .id' 2>/dev/null || \
-            echo "$existing" | sed -n 's/.*"domain":"'"$DOMAIN"'".*"id":"\([^"]*\)".*/\1/p')
-        app_aud=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .aud' 2>/dev/null || \
-            echo "$existing" | sed -n 's/.*"domain":"'"$DOMAIN"'".*"aud":"\([^"]*\)".*/\1/p')
+        _quiet_end
+        app_id=$(json_field "$existing" '.result[0].id')
+        app_aud=$(json_field "$existing" '.result[0].aud')
     fi
     [ -z "$app_id" ] || [ "$app_id" = "null" ] && error "无法创建 Access Application"
     success "✓ Application: $app_id (AUD: $app_aud)"
+
+    _quiet
     curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
         -d '{"name":"Whitelist","decision":"allow","include":[{"email":{"email":"'"$ACCESS_EMAIL"'"}}]}' \
         >> "$LOG_FILE" 2>&1
+    _quiet_end
     success "✓ Policy 已创建"
+
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CF_CONFIG_DIR/$TUNNEL_ID.json
@@ -663,7 +680,7 @@ ingress:
       keepAliveTimeout: 90s
       access:
         required: true
-        teamName: "${DOMAIN%%.*}.cloudflareaccess.com"
+        teamName: "${CF_TEAM_NAME}.cloudflareaccess.com"
         audTag: ["$app_aud"]
   - service: http_status:404
 logfile: $CF_CONFIG_DIR/tunnel.log
@@ -720,7 +737,7 @@ uninstall() {
         if [[ "$OS_FAMILY" != "macos" ]] && [[ -n "$npm_root" ]] && [[ ! -w "$npm_root" ]]; then
             sudo npm uninstall -g openclaw 2>/dev/null || true
         else
-            npm uninstall -g openclared 2>/dev/null || npm uninstall -g openclaw 2>/dev/null || true
+            npm uninstall -g openclaw 2>/dev/null || true
         fi
     fi
     read -p "删除 Cloudflare Tunnel? (y/n): " -n 1 -r; echo
@@ -729,9 +746,13 @@ uninstall() {
         [ -n "$tid" ] && cloudflared tunnel delete "$tid" 2>/dev/null || true
         rm -rf "$HOME/.cloudflared"
     fi
-    read -p "删除 CF DNS 记录? (y/n): " -n 1 -r; echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        cloudflared tunnel route dns delete "$TUNNEL_NAME" "$DOMAIN" 2>/dev/null || true
+    if [ -n "$DOMAIN" ]; then
+        read -p "删除 CF DNS 记录? (y/n): " -n 1 -r; echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            cloudflared tunnel route dns delete "$TUNNEL_NAME" "$DOMAIN" 2>/dev/null || true
+        fi
+    else
+        warn "⚠️  未指定域名，跳过 DNS 记录删除"
     fi
     success "✅ 卸载完成"
     exit 0
@@ -749,9 +770,10 @@ ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署
   --no-access               跳过 CF Access (不推荐)
   --cf-api-token <token>    CF API Token
   --cf-account-id <id>      CF Account ID
+  --cf-team-name <name>     Zero Trust Team Name
   --access-email <email>    Access 白名单邮箱
   --uninstall               卸载
-  --debug                   调试模式
+  --debug                   调试模式 (set -x)
   --help                    帮助
 
 环境变量:
@@ -789,6 +811,7 @@ main() {
             --no-access) NO_ACCESS=true; shift ;;
             --cf-api-token) CF_API_TOKEN="$2"; shift 2 ;;
             --cf-account-id) CF_ACCOUNT_ID="$2"; shift 2 ;;
+            --cf-team-name) CF_TEAM_NAME="$2"; shift 2 ;;
             --access-email) ACCESS_EMAIL="$2"; shift 2 ;;
             --uninstall) UNINSTALL=true; shift ;;
             --help) show_help ;;
@@ -797,10 +820,11 @@ main() {
         esac
     done
 
-    # OS 检测（卸载也需要）
+    # --debug: 启用 set -x（但在 CF API 调用时会被 _quiet 屏蔽）
+    [ "${DEBUG:-0}" = "1" ] && set -x
+
     detect_os
 
-    # 初始化路径（必须在任何 log/info 调用之前）
     OC_CONFIG_DIR="$HOME/.openclaw"
     CF_CONFIG_DIR="$HOME/.cloudflared"
     LOG_FILE="$OC_CONFIG_DIR/deploy-$TIMESTAMP.log"
