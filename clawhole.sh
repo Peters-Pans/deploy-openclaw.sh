@@ -1,5 +1,5 @@
 #!/bin/bash
-# OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.1
+# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.1
 # 支持 macOS + Linux (Ubuntu/Debian/CentOS/RHEL/Fedora)
 #
 # 特性:
@@ -396,7 +396,7 @@ banner() {
 
 ${CYAN}╔════════════════════════════════════════════════════════════╗
 ║                                                            ║
-║   ${GREEN}OpenClaw + Cloudflare Tunnel 部署 v$SCRIPT_VERSION${CYAN}             ║
+║   ${GREEN}ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署${CYAN}              ║
 ║                                                            ║
 ║   ${YELLOW}$OS_NAME $OS_VERSION ($OS_FAMILY) | $PKG_MANAGER${CYAN}                    ║
 ║                                                            ║
@@ -610,7 +610,7 @@ uninstall() {
 
 show_help() {
     cat <<EOF
-OpenClaw + Cloudflare Tunnel 部署 v$SCRIPT_VERSION
+ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署
 
 用法: ./$SCRIPT_NAME [选项]
 

@@ -1,4 +1,4 @@
-# 私有化部署 OpenClaw — Cloudflare Zero Trust
+# ClawHole — 私有化部署 OpenClaw
 
 > **无公网 IP | 零端口暴露 | 跨平台 (macOS + Linux)**  
 > 🦞 适配中国大陆动态 IPv4，免备案，一键部署
