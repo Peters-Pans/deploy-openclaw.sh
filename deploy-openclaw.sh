@@ -527,7 +527,7 @@ EOF
 }
 
 configure_cf_access() {
-    [ "$ENABLE_ACCESS" != "true" ] && info "跳过 CF Access (未启用)" && return 0
+    [ "$NO_ACCESS" = "true" ] && info "跳过 CF Access (--no-access)" && return 0
     echo -e "${GREEN}===== Cloudflare Access =====${NC}"
     [ -z "$CF_API_TOKEN" ] && { read -s -p "▶ CF API Token: " CF_API_TOKEN; echo ""; }
     [ -z "$CF_ACCOUNT_ID" ] && read -p "▶ CF Account ID: " CF_ACCOUNT_ID
@@ -617,7 +617,7 @@ OpenClaw + Cloudflare Tunnel 部署 v$SCRIPT_VERSION
 选项:
   --domain <域名>           访问域名
   --port <端口>             监听端口 (默认 $DEFAULT_PORT)
-  --enable-access           启用 CF Access Zero Trust
+  --no-access               跳过 CF Access (不推荐)
   --cf-api-token <token>    CF API Token
   --cf-account-id <id>      CF Account ID
   --access-email <email>    Access 白名单邮箱
@@ -643,7 +643,7 @@ main() {
         case $1 in
             --domain) DOMAIN="$2"; shift 2 ;;
             --port) PORT="$2"; shift 2 ;;
-            --enable-access) ENABLE_ACCESS=true; shift ;;
+            --no-access) NO_ACCESS=true; shift ;;
             --cf-api-token) CF_API_TOKEN="$2"; shift 2 ;;
             --cf-account-id) CF_ACCOUNT_ID="$2"; shift 2 ;;
             --access-email) ACCESS_EMAIL="$2"; shift 2 ;;

@@ -128,16 +128,26 @@ The script will:
 3. Generate a secure auth token and save it to `~/.openclaw/.auth_token`
 4. Install and configure OpenClaw (loopback-only)
 5. Create a Cloudflare Tunnel and DNS route
-6. Set up auto-start service (launchd or systemd)
-7. Verify the deployment
+6. **Set up Cloudflare Access (Zero Trust)** — prompts for API Token, Account ID, allowed email
+7. Set up auto-start service (launchd or systemd)
+8. Verify the deployment
 
-### Enable Zero Trust (CF Access)
+### Default: Zero Trust Mode
 
 ```bash
-./deploy.sh --domain claw.example.com --enable-access
+./deploy.sh --domain claw.example.com
 ```
 
-You'll be prompted for your API Token, Account ID, and allowed email.
+You'll be prompted for your CF API Token, Account ID, and allowed email.  
+This enables 4-layer defense: Edge → Access JWT → cloudflared verification → OpenClaw Token.
+
+### Skip Zero Trust (not recommended)
+
+```bash
+./deploy.sh --domain claw.example.com --no-access
+```
+
+Only uses OpenClaw Token for auth. Use this if you don't have a Cloudflare account set up yet or prefer simpler auth.
 
 ### Pass Token via Environment Variable
 
@@ -157,28 +167,30 @@ Restores DNS, removes services, cleans up config. Optionally removes OpenClaw CL
 
 ## Security Architecture
 
-### Default Mode
-
-```
-Internet
- → Cloudflare Edge (DDoS / WAF / SSL termination)
- → Cloudflare Tunnel (outbound, IP hidden)
- → OpenClaw Token (gateway.auth.token)
- → OpenClaw UI
-```
-
-### Zero Trust Mode (`--enable-access`)
+### Default: Zero Trust Mode
 
 ```
 Internet
  → Cloudflare Edge (DDoS / WAF)
- → CF Access (email whitelist + optional MFA → RS256 JWT)
+ → CF Access (email whitelist + RS256 JWT)
  → cloudflared local verification (Origin JWT AUD + signature → 403 if invalid)
  → OpenClaw Token
  → OpenClaw UI
 ```
 
 Attackers need to break: Cloudflare Access auth + JWT signature + OpenClaw Token.
+
+### Simple Mode (`--no-access`, not recommended)
+
+```
+Internet
+ → Cloudflare Edge (DDoS / WAF / SSL)
+ → Cloudflare Tunnel (outbound, IP hidden)
+ → OpenClaw Token
+ → OpenClaw UI
+```
+
+Only relies on OpenClaw Token. Token leak = service exposed.
 
 ---
 
@@ -188,7 +200,7 @@ Attackers need to break: Cloudflare Access auth + JWT signature + OpenClaw Token
 |--------|-------------|
 | `--domain <domain>` | Access domain (e.g. `claw.example.com`) |
 | `--port <port>` | Listen port (default: 10371) |
-| `--enable-access` | Enable Cloudflare Access Zero Trust |
+| `--no-access` | 跳过 CF Access Zero Trust (不推荐) |
 | `--cf-api-token <token>` | CF API Token |
 | `--cf-account-id <id>` | CF Account ID |
 | `--access-email <email>` | Allowed email for Access |

@@ -133,16 +133,26 @@ chmod +x deploy.sh
 3. 生成安全 Token 并存储到 `~/.openclaw/.auth_token`
 4. 安装配置 OpenClaw（仅监听 127.0.0.1）
 5. 创建 Cloudflare Tunnel + DNS 路由
-6. 配置开机自启（launchd 或 systemd）
-7. 验证部署
+6. **配置 Cloudflare Access (Zero Trust)** — 提示输入 API Token、Account ID、允许的邮箱
+7. 配置开机自启（launchd 或 systemd）
+8. 验证部署
 
-### 启用 Zero Trust
+### 默认启用 Zero Trust
 
 ```bash
-./deploy.sh --domain claw.example.com --enable-access
+./deploy.sh --domain claw.example.com
 ```
 
-脚本会提示输入 API Token、Account ID 和允许登录的邮箱。
+脚本会提示输入 CF API Token、Account ID 和允许登录的邮箱。  
+自动启用四层防线：CF 边缘 → Access JWT → cloudflared 验证 → OpenClaw Token。
+
+### 跳过 Zero Trust（不推荐）
+
+```bash
+./deploy.sh --domain claw.example.com --no-access
+```
+
+仅使用 OpenClaw Token 认证。适用于还没配置好 CF Access 或偏好简单认证的场景。
 
 ### 通过环境变量安全传递 Token
 
@@ -162,21 +172,23 @@ OPENCLAW_TOKEN=$(openssl rand -hex 32) ./deploy.sh --domain claw.example.com
 
 ## 🔒 安全架构
 
-### 默认模式
+### 默认模式：Zero Trust
 
 ```
-公网 → Cloudflare 边缘 (DDoS/WAF/SSL) → Tunnel → OpenClaw Token → UI
-```
-
-### Zero Trust 模式 (`--enable-access`)
-
-```
-公网 → CF 边缘 → CF Access (邮箱白名单 + 可选 MFA → JWT)
+公网 → CF 边缘 (DDoS/WAF) → CF Access (邮箱白名单 + JWT)
   → cloudflared 本地验证 (Origin JWT AUD + 签名 → 无效则 403)
   → OpenClaw Token → UI
 ```
 
 攻击者需要同时突破：Cloudflare Access 认证 + JWT 签名伪造 + OpenClaw Token。
+
+### 简单模式 (`--no-access`，不推荐)
+
+```
+公网 → CF 边缘 → Tunnel → OpenClaw Token → UI
+```
+
+仅依赖 OpenClaw Token。Token 泄露 = 服务暴露。
 
 ---
 
@@ -186,7 +198,7 @@ OPENCLAW_TOKEN=$(openssl rand -hex 32) ./deploy.sh --domain claw.example.com
 |------|------|
 | `--domain <域名>` | 访问域名 |
 | `--port <端口>` | 监听端口 (默认 10371) |
-| `--enable-access` | 启用 CF Access Zero Trust |
+| `--no-access` | 跳过 CF Access Zero Trust（不推荐） |
 | `--cf-api-token <token>` | CF API Token |
 | `--cf-account-id <id>` | CF Account ID |
 | `--access-email <email>` | Access 白名单邮箱 |
