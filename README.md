@@ -7,7 +7,7 @@
 > **Private, portless, works anywhere.**  
 > No public IP, no port forwarding, no hassle. Cross-platform (macOS + Linux).
 
-[中文文档](README.zh.md)
+[Chinese (中文)](README.zh.md)
 
 ---
 
@@ -200,7 +200,7 @@ Only relies on OpenClaw Token. Token leak = service exposed.
 |--------|-------------|
 | `--domain <domain>` | Access domain (e.g. `claw.example.com`) |
 | `--port <port>` | Listen port (default: 10371) |
-| `--no-access` | 跳过 CF Access Zero Trust (不推荐) |
+| `--no-access` | Skip CF Access Zero Trust (not recommended) |
 | `--cf-api-token <token>` | CF API Token |
 | `--cf-account-id <id>` | CF Account ID |
 | `--access-email <email>` | Allowed email for Access |
