@@ -1,13 +1,6 @@
 #!/bin/bash
-# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.1
+# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.2
 # 支持 macOS + Linux (Ubuntu/Debian/CentOS/RHEL/Fedora)
-#
-# 特性:
-#   ✅ 真实 IP 完全隐藏
-#   ✅ 零公网端口暴露
-#   ✅ 跨平台: macOS (launchd) + Linux (systemd)
-#   ✅ 可选 Cloudflare Access (Zero Trust)
-#   ✅ 安全加固: Token 文件存储 / 日志权限 600 / DNS 备份恢复
 #
 # 用法: ./clawhole.sh [选项]
 
@@ -15,13 +8,12 @@ set -e
 set -o pipefail
 
 # ========== 全局配置 ==========
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 readonly TUNNEL_NAME="openclaw-tunnel"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
-# 颜色定义
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
@@ -31,7 +23,92 @@ readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
 readonly NC='\033[0m'
 
-# ========== OS 抽象层 ==========
+# ========== 延迟初始化的路径变量 ==========
+OC_CONFIG_DIR=""
+CF_CONFIG_DIR=""
+LOG_FILE=""
+
+# ========== 版本比较（兼容 macOS sort）==========
+# macOS sort 不支持 -V，用 awk 手动比较
+version_gte() {
+    # 返回 0 如果 $1 >= $2
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        split(a, aa, "."); split(b, bb, ".")
+        for (i = 1; i <= 3; i++) {
+            if (aa[i]+0 > bb[i]+0) exit 0
+            if (aa[i]+0 < bb[i]+0) exit 1
+        }
+        exit 0
+    }' 2>/dev/null || {
+        # 极端 fallback: 纯 bash
+        local IFS='.'
+        local -a aa=($1) bb=($2)
+        for i in 0 1 2; do
+            [ "${aa[$i]:-0}" -gt "${bb[$i]:-0}" ] && return 0
+            [ "${aa[$i]:-0}" -lt "${bb[$i]:-0}" ] && return 1
+        done
+        return 0
+    }
+}
+
+# ========== 端口检测（多工具回退）==========
+port_in_use() {
+    local port="$1"
+    lsof -ti ":$port" &>/dev/null && return 0
+    ss -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    netstat -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    return 1
+}
+
+# ========== 工具函数 ==========
+
+log() {
+    local msg="$1" level="${2:-INFO}" color="$BLUE"
+    case "$level" in INFO) color="$BLUE" ;; WARN) color="$YELLOW" ;; ERROR) color="$RED" ;; SUCCESS) color="$GREEN" ;; esac
+    # LOG_FILE 可能尚未初始化，安全追加
+    if [ -n "$LOG_FILE" ]; then
+        echo -e "${color}[${level}]${NC} $msg" | tee -a "$LOG_FILE"
+    else
+        echo -e "${color}[${level}]${NC} $msg"
+    fi
+}
+info() { log "$1" "INFO"; }
+warn() { log "$1" "WARN" >&2; }
+error() { log "$1" "ERROR" >&2; exit 1; }
+success() { log "$1" "SUCCESS"; }
+
+# Token 生成：失败则报错退出，不静默降级
+generate_secure_token() {
+    openssl rand -hex 32 2>/dev/null || error "openssl 不可用，无法生成安全 Token。请安装 openssl。"
+}
+
+# 安全写入 openclaw 配置：通过文件传递 Token，避免暴露在 ps 中
+oc_config_set() {
+    local key="$1" value="$2"
+    if [ "$key" = "gateway.auth.token" ]; then
+        # Token 通过 stdin 传入，不经过命令行参数
+        echo -n "$value" | openclaw config set "$key" --stdin >> "$LOG_FILE" 2>&1 || \
+            # 回退: 写入临时文件再读取（权限 600）
+            { local tmpf=$(mktemp) && echo -n "$value" > "$tmpf" && chmod 600 "$tmpf" && \
+              openclaw config set "$key" "$(cat "$tmpf")" >> "$LOG_FILE" 2>&1 && rm -f "$tmpf"; }
+    else
+        openclaw config set "$key" "$value" >> "$LOG_FILE" 2>&1
+    fi
+}
+
+# JSON 解析：优先 jq，回退到 grep（仅限简单字段）
+json_field() {
+    local json="$1" field="$2"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r "$field" 2>/dev/null
+    else
+        # 简单回退: 提取第一层字符串字段
+        local key=$(echo "$field" | sed 's/.*\.//' | sed 's/\.result\.//')
+        echo "$json" | sed -n "s/.*\"${key}\":\"\([^\"]*\)\".*/\1/p" | head -1
+    fi
+}
+
+# ========== OS 检测 ==========
 
 detect_os() {
     OS_NAME=""
@@ -74,6 +151,20 @@ pkg_install() {
     esac
 }
 
+check_system_compat() {
+    info "系统: $OS_NAME $OS_VERSION ($OS_FAMILY) | 包管理: $PKG_MANAGER"
+    case "$OS_FAMILY" in
+        macos)
+            version_gte "$OS_VERSION" "11.0" || warn "⚠️  建议 macOS 11.0+"
+            ;;
+        *)
+            command -v sudo &>/dev/null || error "Linux 部署需要 sudo"
+            ;;
+    esac
+}
+
+# ========== 依赖安装 ==========
+
 install_cloudflared() {
     if command -v cloudflared &>/dev/null; then
         local ver=$(cloudflared --version 2>/dev/null | awk '{print $2}')
@@ -111,7 +202,7 @@ install_cloudflared() {
 install_nodejs() {
     if command -v node &>/dev/null; then
         local ver=$(node --version 2>/dev/null | cut -d'v' -f2)
-        if [ "$(printf '%s\n' "18" "$ver" | sort -V | head -n1)" = "18" ]; then
+        if version_gte "$ver" "18"; then
             success "✓ Node.js $ver 已安装"
             return 0
         fi
@@ -135,22 +226,6 @@ install_nodejs() {
     success "✓ Node.js $ver 安装成功"
 }
 
-check_system_compat() {
-    info "系统: $OS_NAME $OS_VERSION ($OS_FAMILY) | 包管理: $PKG_MANAGER"
-    case "$OS_FAMILY" in
-        macos)
-            [ "$(printf '%s\n' "11.0" "$OS_VERSION" | sort -V | head -n1)" != "11.0" ] && warn "⚠️  建议 macOS 11.0+"
-            ;;
-        *)
-            command -v sudo &>/dev/null || error "Linux 部署需要 sudo"
-            ;;
-    esac
-}
-
-# ========== 服务管理抽象 ==========
-
-find_openclaw_bin() { command -v openclaw 2>/dev/null || echo "/usr/local/bin/openclaw"; }
-
 install_openclaw() {
     info "安装 OpenClaw CLI..."
     if command -v openclaw &>/dev/null; then
@@ -159,7 +234,9 @@ install_openclaw() {
         read -p "更新到最新版? (y/n): " -n 1 -r; echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
     fi
-    if [[ "$OS_FAMILY" != "macos" ]] && [[ ! -w "$(npm root -g 2>/dev/null)" ]]; then
+    local npm_root
+    npm_root=$(npm root -g 2>/dev/null) || npm_root=""
+    if [[ "$OS_FAMILY" != "macos" ]] && [[ -n "$npm_root" ]] && [[ ! -w "$npm_root" ]]; then
         sudo npm install -g openclaw@latest >> "$LOG_FILE" 2>&1
     else
         npm install -g openclaw@latest >> "$LOG_FILE" 2>&1
@@ -167,6 +244,10 @@ install_openclaw() {
     local ver=$(openclaw --version 2>/dev/null | head -n1)
     success "✓ OpenClaw $ver 安装成功"
 }
+
+# ========== 服务管理 ==========
+
+find_openclaw_bin() { command -v openclaw 2>/dev/null || echo "/usr/local/bin/openclaw"; }
 
 service_install() {
     local oc_bin=$(find_openclaw_bin)
@@ -306,19 +387,25 @@ _uninstall_systemd() {
     sudo systemctl daemon-reload 2>/dev/null || true
 }
 
-# ========== DNS 抽象 ==========
+# ========== DNS ==========
 
 dns_backup() {
     local backup_file="$OC_CONFIG_DIR/.dns_backup"
     case "$OS_FAMILY" in
         macos)
-            local iface=$(networksetup -listnetworkserviceorder | grep "$(route get default 2>/dev/null | grep interface | awk '{print $2}')" | head -1 | sed 's/.*Port: \(.*\),.*/\1/')
+            local iface=""
+            local default_if=$(route get default 2>/dev/null | awk '/interface:/{print $2}')
+            if [ -n "$default_if" ]; then
+                iface=$(networksetup -listnetworkserviceorder | grep -B1 "$default_if" | head -1 | sed 's/.*Port: \(.*\),.*/\1/')
+            fi
             if [ -n "$iface" ]; then
                 echo "macos" > "$backup_file"
                 echo "$iface" >> "$backup_file"
                 networksetup -getdnsservers "$iface" 2>/dev/null >> "$backup_file" || echo "Empty" >> "$backup_file"
                 chmod 600 "$backup_file"
                 info "DNS 已备份 ($iface)"
+            else
+                warn "⚠️  无法检测网络接口，跳过 DNS 备份"
             fi
             ;;
         *)
@@ -336,13 +423,25 @@ dns_set_doh() {
     info "配置 DNS (1.1.1.1 / 1.0.0.1)..."
     case "$OS_FAMILY" in
         macos)
-            local iface=$(networksetup -listnetworkserviceorder | grep "$(route get default 2>/dev/null | grep interface | awk '{print $2}')" | head -1 | sed 's/.*Port: \(.*\),.*/\1/')
-            [ -n "$iface" ] && networksetup -setdnsservers "$iface" 1.1.1.1 1.0.0.1 2>/dev/null && success "✓ DNS 已设置" || warn "⚠️  DNS 设置失败"
+            local iface=""
+            local default_if=$(route get default 2>/dev/null | awk '/interface:/{print $2}')
+            if [ -n "$default_if" ]; then
+                iface=$(networksetup -listnetworkserviceorder | grep -B1 "$default_if" | head -1 | sed 's/.*Port: \(.*\),.*/\1/')
+            fi
+            if [ -n "$iface" ]; then
+                networksetup -setdnsservers "$iface" 1.1.1.1 1.0.0.1 2>/dev/null && success "✓ DNS 已设置 ($iface)" || warn "⚠️  DNS 设置失败"
+            else
+                warn "⚠️  无法检测网络接口，跳过 DNS 设置"
+            fi
             ;;
         *)
             if command -v resolvectl &>/dev/null; then
                 local iface=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
-                [ -n "$iface" ] && sudo resolvectl dns "$iface" 1.1.1.1 1.0.0.1 2>/dev/null && success "✓ DNS (resolvectl)" || warn "⚠️  resolvectl 失败"
+                if [ -n "$iface" ]; then
+                    sudo resolvectl dns "$iface" 1.1.1.1 1.0.0.1 2>/dev/null && success "✓ DNS (resolvectl, $iface)" || warn "⚠️  resolvectl 失败"
+                else
+                    warn "⚠️  无法检测默认网卡，跳过 resolvectl"
+                fi
             else
                 sudo tee /etc/resolv.conf > /dev/null <<'EOF'
 nameserver 1.1.1.1
@@ -363,6 +462,7 @@ dns_restore() {
     case "$platform" in
         macos)
             local iface=$(sed -n '2p' "$backup_file")
+            [ -z "$iface" ] && { warn "⚠️  DNS 备份无接口信息"; rm -f "$backup_file"; return 0; }
             local dns=$(sed -n '3p' "$backup_file")
             if [ "$dns" = "Empty" ] || [ -z "$dns" ]; then
                 networksetup -setdnsservers "$iface" "Empty" 2>/dev/null && success "✓ DNS 已恢复 (DHCP)"
@@ -371,45 +471,26 @@ dns_restore() {
             fi
             ;;
         linux)
-            [ -f "$OC_CONFIG_DIR/.resolv.conf.bak" ] && sudo cp "$OC_CONFIG_DIR/.resolv.conf.bak" /etc/resolv.conf && success "✓ DNS 已恢复" && rm -f "$OC_CONFIG_DIR/.resolv.conf.bak"
+            if [ -f "$OC_CONFIG_DIR/.resolv.conf.bak" ]; then
+                sudo cp "$OC_CONFIG_DIR/.resolv.conf.bak" /etc/resolv.conf && success "✓ DNS 已恢复"
+                rm -f "$OC_CONFIG_DIR/.resolv.conf.bak"
+            fi
             ;;
     esac
     rm -f "$backup_file"
 }
 
-# ========== 工具函数 ==========
-
-log() {
-    local msg="$1" level="${2:-INFO}" color="$BLUE"
-    case "$level" in INFO) color="$BLUE" ;; WARN) color="$YELLOW" ;; ERROR) color="$RED" ;; SUCCESS) color="$GREEN" ;; esac
-    echo -e "${color}[${level}]${NC} $msg" | tee -a "$LOG_FILE"
-}
-info() { log "$1" "INFO"; }
-warn() { log "$1" "WARN" >&2; }
-error() { log "$1" "ERROR" >&2; exit 1; }
-success() { log "$1" "SUCCESS"; }
-
-generate_secure_token() { openssl rand -hex 32 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 64; }
-
-banner() {
-    cat <<EOF
-
-${CYAN}╔════════════════════════════════════════════════════════════╗
-║                                                            ║
-║   ${GREEN}ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署${CYAN}              ║
-║                                                            ║
-║   ${YELLOW}$OS_NAME $OS_VERSION ($OS_FAMILY) | $PKG_MANAGER${CYAN}                    ║
-║                                                            ║
-╚════════════════════════════════════════════════════════════╝${NC}
-
-EOF
-}
+# ========== 验证 ==========
 
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] || error "端口 '$port' 无效"
-    [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ] && error "端口范围: 1024-65535"
-    (lsof -ti ":$port" &>/dev/null || ss -tlnp 2>/dev/null | grep -q ":$port ") && error "端口 $port 已被占用"
+    if [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+        error "端口范围: 1024-65535"
+    fi
+    if port_in_use "$port"; then
+        error "端口 $port 已被占用"
+    fi
     success "✓ 端口 $port 可用"
 }
 
@@ -465,11 +546,11 @@ get_user_config() {
 configure_openclaw() {
     info "配置 OpenClaw..."
     mkdir -p "$OC_CONFIG_DIR"
-    openclaw config set gateway.port "$PORT" >> "$LOG_FILE" 2>&1
-    openclaw config set gateway.bind "loopback" >> "$LOG_FILE" 2>&1
-    openclaw config set gateway.mode "local" >> "$LOG_FILE" 2>&1
-    openclaw config set gateway.auth.mode "token" >> "$LOG_FILE" 2>&1
-    openclaw config set gateway.auth.token "$TOKEN" >> "$LOG_FILE" 2>&1
+    oc_config_set gateway.port "$PORT"
+    oc_config_set gateway.bind "loopback"
+    oc_config_set gateway.mode "local"
+    oc_config_set gateway.auth.mode "token"
+    oc_config_set gateway.auth.token "$TOKEN"
     success "✓ 配置已写入"
     openclaw config validate >> "$LOG_FILE" 2>&1 || error "配置验证失败"
     success "✓ 配置验证通过"
@@ -479,7 +560,11 @@ configure_openclaw() {
     info "启动 OpenClaw..."
     openclaw gateway start --force >> "$LOG_FILE" 2>&1 || error "启动失败"
     sleep 5
-    (lsof -ti "127.0.0.1:$PORT" &>/dev/null || ss -tlnp 2>/dev/null | grep -q ":$PORT ") && success "✓ OpenClaw 运行中 (127.0.0.1:$PORT)" || error "未监听"
+    if port_in_use "$PORT"; then
+        success "✓ OpenClaw 运行中 (127.0.0.1:$PORT)"
+    else
+        error "OpenClaw 未正确监听 127.0.0.1:$PORT"
+    fi
 }
 
 configure_tunnel() {
@@ -496,6 +581,12 @@ configure_tunnel() {
     if cloudflared tunnel list 2>/dev/null | grep -q "$TUNNEL_NAME"; then
         tunnel_id=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}')
         warn "⚠️  复用隧道: $tunnel_id"
+        # 检查凭据文件是否存在
+        if [ ! -f "$CF_CONFIG_DIR/$tunnel_id.json" ]; then
+            warn "⚠️  凭据文件 $CF_CONFIG_DIR/$tunnel_id.json 不存在，可能需要重新创建隧道"
+            warn "    运行: cloudflared tunnel delete $TUNNEL_NAME && rm -f $CF_CONFIG_DIR/$tunnel_id.json"
+            warn "    然后重新执行本脚本"
+        fi
     else
         local out=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
         tunnel_id=$(echo "$out" | sed -n 's/.*Tunnel ID: *\([0-9a-f-]*\).*/\1/p')
@@ -533,19 +624,30 @@ configure_cf_access() {
     [ -z "$CF_ACCOUNT_ID" ] && read -p "▶ CF Account ID: " CF_ACCOUNT_ID
     [ -z "$ACCESS_EMAIL" ] && read -p "▶ 允许的邮箱: " ACCESS_EMAIL
     local api="https://api.cloudflare.com/client/v4"
-    local auth="Authorization: Bearer $CF_API_TOKEN"
+    # CF API Token 不写入日志
     info "创建 Access Application..."
-    local resp=$(curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" -H "$auth" -H "Content-Type: application/json" \
-        -d '{"name":"OpenClaw","domain":"'"$DOMAIN"'","type":"self_hosted","session_duration":"24h","auto_redirect_to_identity":false}')
-    local app_id=$(echo "$resp" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-    local app_aud=$(echo "$resp" | sed -n 's/.*"aud":"\([^"]*\)".*/\1/p')
-    [ -z "$app_id" ] && { local ex=$(curl -s "$api/accounts/$CF_ACCOUNT_ID/access/apps" -H "$auth" | sed -n 's/.*"domain":"'"$DOMAIN"'".*"id":"\([^"]*\)".*"aud":"\([^"]*\)".*/\1 \2/p'); app_id=$(echo "$ex"|awk '{print $1}'); app_aud=$(echo "$ex"|awk '{print $2}'); }
-    [ -z "$app_id" ] && error "无法创建 Application"
+    local resp=$(curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
+        -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"OpenClaw","domain":"'"$DOMAIN"'","type":"self_hosted","session_duration":"24h","auto_redirect_to_identity":false}' \
+        2>> "$LOG_FILE")
+    local app_id=$(json_field "$resp" '.result.id')
+    local app_aud=$(json_field "$resp" '.result.aud')
+    if [ -z "$app_id" ] || [ "$app_id" = "null" ]; then
+        # 可能已存在，查找
+        local existing=$(curl -s "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
+            -H "Authorization: Bearer $CF_API_TOKEN" 2>> "$LOG_FILE")
+        app_id=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .id' 2>/dev/null || \
+            echo "$existing" | sed -n 's/.*"domain":"'"$DOMAIN"'".*"id":"\([^"]*\)".*/\1/p')
+        app_aud=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .aud' 2>/dev/null || \
+            echo "$existing" | sed -n 's/.*"domain":"'"$DOMAIN"'".*"aud":"\([^"]*\)".*/\1/p')
+    fi
+    [ -z "$app_id" ] || [ "$app_id" = "null" ] && error "无法创建 Access Application"
     success "✓ Application: $app_id (AUD: $app_aud)"
-    curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" -H "$auth" -H "Content-Type: application/json" \
-        -d '{"name":"Whitelist","decision":"allow","include":[{"email":{"email":"'"$ACCESS_EMAIL"'"}}]}' >> "$LOG_FILE" 2>&1
+    curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" \
+        -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"Whitelist","decision":"allow","include":[{"email":{"email":"'"$ACCESS_EMAIL"'"}}]}' \
+        >> "$LOG_FILE" 2>&1
     success "✓ Policy 已创建"
-    # 更新 config.yml 加入 origin JWT
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CF_CONFIG_DIR/$TUNNEL_ID.json
@@ -568,16 +670,29 @@ logfile: $CF_CONFIG_DIR/tunnel.log
 loglevel: info
 EOF
     success "✓ Origin JWT 验证已启用"
-    echo -e "${GREEN}四层防线: Edge → Access JWT → cloudflared → OpenClaw Token${NC}"
 }
 
 verify_deployment() {
     echo -e "${GREEN}===== 部署验证 =====${NC}"
     local ok=true
     info "OpenClaw 监听..."
-    (lsof -ti "127.0.0.1:$PORT" &>/dev/null || ss -tlnp 2>/dev/null | grep -q ":$PORT ") && success "✓ 运行中" || ok=false
+    if port_in_use "$PORT"; then
+        success "✓ 运行中"
+    else
+        ok=false
+    fi
     info "Tunnel 进程..."
-    pgrep -f "cloudflared.*tunnel" &>/dev/null && success "✓ 运行中" || { sleep 10; pgrep -f "cloudflared.*tunnel" &>/dev/null && success "✓ 已启动" || { warn "⚠️  未检测到"; ok=false; }; }
+    if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
+        success "✓ 运行中"
+    else
+        sleep 15
+        if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
+            success "✓ 已启动"
+        else
+            warn "⚠️  未检测到 Tunnel 进程"
+            ok=false
+        fi
+    fi
     info "域名可达性..."
     local code=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN" 2>/dev/null || echo "000")
     [[ "$code" =~ ^(200|301|302|401|403)$ ]] && success "✓ HTTP $code" || warn "⚠️  HTTP $code (DNS 可能需几分钟)"
@@ -599,11 +714,25 @@ uninstall() {
     rm -f "$OC_CONFIG_DIR/.auth_token" "$LOG_FILE"
     dns_restore
     read -p "卸载 OpenClaw CLI? (y/n): " -n 1 -r; echo
-    [[ $REPLY =~ ^[Yy]$ ]] && { [[ "$OS_FAMILY" != "macos" ]] && ! -w "$(npm root -g 2>/dev/null)" && sudo npm uninstall -g openclaw || npm uninstall -g openclaw; } 2>/dev/null || true
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        local npm_root
+        npm_root=$(npm root -g 2>/dev/null) || npm_root=""
+        if [[ "$OS_FAMILY" != "macos" ]] && [[ -n "$npm_root" ]] && [[ ! -w "$npm_root" ]]; then
+            sudo npm uninstall -g openclaw 2>/dev/null || true
+        else
+            npm uninstall -g openclared 2>/dev/null || npm uninstall -g openclaw 2>/dev/null || true
+        fi
+    fi
     read -p "删除 Cloudflare Tunnel? (y/n): " -n 1 -r; echo
-    [[ $REPLY =~ ^[Yy]$ ]] && { local tid=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}'); [ -n "$tid" ] && cloudflared tunnel delete "$tid"; rm -rf "$HOME/.cloudflared"; } 2>/dev/null || true
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        local tid=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}')
+        [ -n "$tid" ] && cloudflared tunnel delete "$tid" 2>/dev/null || true
+        rm -rf "$HOME/.cloudflared"
+    fi
     read -p "删除 CF DNS 记录? (y/n): " -n 1 -r; echo
-    [[ $REPLY =~ ^[Yy}$ ]] && cloudflared tunnel route dns delete "$TUNNEL_NAME" "$DOMAIN" 2>/dev/null || true
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        cloudflared tunnel route dns delete "$TUNNEL_NAME" "$DOMAIN" 2>/dev/null || true
+    fi
     success "✅ 卸载完成"
     exit 0
 }
@@ -638,6 +767,20 @@ EOF
     exit 0
 }
 
+banner() {
+    cat <<EOF
+
+${CYAN}╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║   ${GREEN}ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署${CYAN}              ║
+║                                                            ║
+║   ${YELLOW}$OS_NAME $OS_VERSION ($OS_FAMILY) | $PKG_MANAGER${CYAN}                    ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝${NC}
+
+EOF
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -653,13 +796,20 @@ main() {
             *) error "未知参数: $1" ;;
         esac
     done
-    [ "$UNINSTALL" = "true" ] && { detect_os; uninstall; }
+
+    # OS 检测（卸载也需要）
     detect_os
+
+    # 初始化路径（必须在任何 log/info 调用之前）
     OC_CONFIG_DIR="$HOME/.openclaw"
     CF_CONFIG_DIR="$HOME/.cloudflared"
     LOG_FILE="$OC_CONFIG_DIR/deploy-$TIMESTAMP.log"
     mkdir -p "$OC_CONFIG_DIR"
-    touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+
+    [ "$UNINSTALL" = "true" ] && uninstall
+
     banner
     check_dependencies
     get_user_config
@@ -671,7 +821,7 @@ main() {
     configure_cf_access
     service_install
     service_start
-    sleep 5
+    sleep 10
     verify_deployment
     echo ""
     echo -e "${GREEN}✅ 部署成功！${NC}"
