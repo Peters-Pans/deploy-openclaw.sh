@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Cross-platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-999999.svg)]()
-[![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/deploy-openclaw)
+[![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/clawhole)
 
 > **Private, portless, works anywhere.**  
 > No public IP, no port forwarding, no hassle. Cross-platform (macOS + Linux).
@@ -112,7 +112,7 @@ If you want `--enable-access`, prepare these in advance:
 
 ```bash
 # Download
-curl -fsSL https://raw.githubusercontent.com/Peters-Pans/deploy-openclaw/main/deploy-openclaw.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Peters-Pans/clawhole/main/clawhole.sh -o deploy.sh
 
 # Review the script before running!
 less deploy.sh

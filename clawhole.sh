@@ -9,14 +9,14 @@
 #   ✅ 可选 Cloudflare Access (Zero Trust)
 #   ✅ 安全加固: Token 文件存储 / 日志权限 600 / DNS 备份恢复
 #
-# 用法: ./deploy-openclaw.sh [选项]
+# 用法: ./clawhole.sh [选项]
 
 set -e
 set -o pipefail
 
 # ========== 全局配置 ==========
 readonly SCRIPT_VERSION="3.1.0"
-readonly SCRIPT_NAME="deploy-openclaw.sh"
+readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 readonly TUNNEL_NAME="openclaw-tunnel"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)

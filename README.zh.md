@@ -113,7 +113,7 @@
 
 ```bash
 # 下载
-curl -fsSL https://raw.githubusercontent.com/Peters-Pans/deploy-openclaw/main/deploy-openclaw.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/Peters-Pans/clawhole/main/clawhole.sh -o deploy.sh
 
 # 审查（强烈建议执行前看看脚本内容）
 less deploy.sh
